@@ -23,6 +23,10 @@ Contents of the shared folder:
 - Pre-trained **Detectree2** and **SAM** models.
 - Intermediate segmentation results (to reproduce the R analyses directly if needed).
 - GDAL wheel used in requirement.txt
+- Docker image (.tar archive)
+- **Checkpoints** containing pre-computed IoU results used in `analysis/Script_analyse_art.Rmd`.  
+  These files let you reproduce the statistics and figures **without re-running the time-consuming IoU computations**.
+  If you prefer to recompute IoU yourself, simply remove the checkpoints and re-run the RMarkdown script.
 
 ## 🧾 License
 - **Code**: MIT License
