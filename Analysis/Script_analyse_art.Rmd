@@ -1,0 +1,1669 @@
+---
+title: "Monitoring plot-level tropical forest canopy structure with automated crown
+  segmentation from low-cost drone imagery"
+author: "Antoine Plumacker"
+date: "2025-09-16"
+output: html_document
+---
+
+# 0. Importation et library \## Appel des librairies
+
+```{r import, message=FALSE}
+library(sf)
+library(dplyr)
+library(raster)
+library(caret)
+library(foreach)
+library(doParallel)
+library(pbapply)
+library(matrixStats)
+library(knitr)
+library(kableExtra)
+library(ggplot2)
+library(cowplot)
+library(terra)
+library(viridis)
+library(tidyr)
+library(scales)
+library(gridExtra)
+library(grid)
+library(car)       # Pour leveneTest (homogénéité des variances)
+library(broom)
+library(patchwork)# Pour avoir des résultats propres
+
+```
+
+## Importation des données
+
+```{r import, message=FALSE}
+
+# Définir le dossier où se trouvent les .gpkg
+data_dir <- "D:/PhD/Data/Art1_rendu"
+
+# Lister tous les fichiers .gpkg dans le dossier
+gpkg_files <- list.files(data_dir, pattern = "\\.gpkg$", full.names = TRUE)
+
+for(f in gpkg_files){
+  name <- tools::file_path_sans_ext(basename(f))
+  assign(name, st_read(f))
+}
+luki_tif <- rast("D:/PhD/Data/Art1_rendu/230504Luki_utm_ref.tif")
+mask     <- rast("D:/PhD/Data/Art1_rendu/mask.tif")
+
+```
+## Prétraitement
+Cette section :
+
+1.  Exclut la parcelle Parc6 (non utilisée dans les analyses).
+
+2.  Crée un polygone unique regroupant toutes les autres parcelles.
+
+3.  Filtre les arbres de chaque méthode pour ne garder que ceux inclus dans ces parcelles.
+
+4.  Vérifie la validité géométrique des objets.
+
+
+```{r pretraitement, message=FALSE}
+
+# Exclure simplement "Parc6" des parcelles lues dans ton gpkg
+plot_filtered <- plots[plots$Nom != "Parc6", ]
+
+# Unionner les parcelles restantes
+plot_combined <- st_union(plot_filtered)
+
+
+# Filtrer les arbres des autres méthodes pour garder uniquement ceux dans les parcelles
+tree_detectree_plot <- Detectree2[st_intersects(Detectree2, plot_combined, sparse = FALSE), ]
+tree_SAM_plot       <- SAM[st_intersects(SAM, plot_combined, sparse = FALSE), ]
+tree_d2s_plot       <- D2S[st_intersects(D2S, plot_combined, sparse = FALSE), ]
+
+
+# Vérifier et corriger la validité des géométries
+photointerpretation_inventory <- st_make_valid(photointerpretation_inventory)
+tree_detectree_plot           <- st_make_valid(tree_detectree_plot)
+tree_SAM_plot                 <- st_make_valid(tree_SAM_plot)
+tree_d2s_plot                 <- st_make_valid(tree_d2s_plot)
+tree_manuel <- photointerpretation_inventory
+plot <- plots
+```
+
+# 1. Validation of ITC segmentations
+
+## Calcul des IoU
+
+Le but ici est de calculer l’Intersection over Union (IoU) pour comparer la similarité entre chaque couronne segmentée automatiquement et les couronnes de référence (photointerprétation). On utilise :
+
+-   un seuil de 0.5 pour considérer un True Positive,
+
+-   la parallélisation pour accélérer les calculs,
+
+-   un système de checkpoints pour éviter de recalculer à chaque fois.
+
+```{r iou, message=TRUE}
+
+# Configuration des checkpoints
+CHECKPOINT_DIR <- "checkpoints"
+if (!dir.exists(CHECKPOINT_DIR)) {
+  dir.create(CHECKPOINT_DIR, recursive = TRUE)
+}
+
+# Fonction pour sauvegarder un checkpoint
+save_checkpoint <- function(data, filename) {
+  checkpoint_path <- file.path(CHECKPOINT_DIR, paste0(filename, ".rds"))
+  saveRDS(data, checkpoint_path)
+  cat("Checkpoint sauvegardé:", checkpoint_path, "\n")
+}
+
+# Fonction pour charger un checkpoint
+load_checkpoint <- function(filename) {
+  checkpoint_path <- file.path(CHECKPOINT_DIR, paste0(filename, ".rds"))
+  if (file.exists(checkpoint_path)) {
+    cat("Chargement du checkpoint:", checkpoint_path, "\n")
+    return(readRDS(checkpoint_path))
+  }
+  return(NULL)
+}
+
+# Fonction pour effectuer les calculs d'IoU
+calculate_iou <- function(pred, ref) {
+  intersection <- st_intersection(pred, ref)
+  union <- st_union(pred, ref)
+  if (length(intersection) > 0 && length(union) > 0) {
+    return(as.numeric(st_area(intersection) / st_area(union)))
+  } else {
+    return(0)
+  }
+}
+
+
+# Vérifier si les données de base existent déjà
+if (file.exists(file.path(CHECKPOINT_DIR, "data_loaded.rds"))) {
+  cat("Chargement des données depuis le checkpoint...\n")
+  loaded_data <- readRDS(file.path(CHECKPOINT_DIR, "data_loaded.rds"))
+  list2env(loaded_data, envir = .GlobalEnv)
+} else {
+  cat("Chargement des données depuis les fichiers sources...\n")
+  
+  # Sauvegarder le checkpoint des données de base
+  data_to_save <- list(
+    tree_manuel = tree_manuel,
+    tree_detectree_plot = tree_detectree_plot,
+    tree_SAM_plot = tree_SAM_plot,
+    tree_d2s_plot = tree_d2s_plot,
+    plot_combined = plot_combined
+  )
+  saveRDS(data_to_save, file.path(CHECKPOINT_DIR, "data_loaded.rds"))
+  cat("Données de base sauvegardées\n")
+}
+
+# Définir le seuil IoU pour les True Positives
+positive_tresh <- 0.5
+
+# Configuration de la parallélisation
+num_cores <- detectCores() - 2  # Laisser plus de marge
+cl <- makeCluster(num_cores)
+registerDoParallel(cl)
+
+# Exporter les fonctions et les objets nécessaires aux workers
+clusterExport(cl, list("calculate_iou", "st_intersection", "st_union", "st_area"))
+
+# Vérifier si les IoU ont déjà été calculés
+if (file.exists(file.path(CHECKPOINT_DIR, "iou_calculated.rds"))) {
+  cat("Chargement des IoU depuis le checkpoint...\n")
+  iou_data <- readRDS(file.path(CHECKPOINT_DIR, "iou_calculated.rds"))
+  list2env(iou_data, envir = .GlobalEnv)
+} else {
+  cat("Calcul des IoU...\n")
+  
+  # Exporter les données aux workers
+  clusterExport(cl, list("tree_detectree_plot", "tree_SAM_plot", "tree_d2s_plot", "tree_manuel"))
+  
+  # Calcul des IoU pour tree_detectree
+  cat("Calcul IoU pour detectree...\n")
+  tree_detectree_plot$best_iou <- foreach(i = 1:nrow(tree_detectree_plot), .combine = c, .packages = 'sf') %dopar% {
+    max(sapply(1:nrow(tree_manuel), function(j) {
+      calculate_iou(st_geometry(tree_detectree_plot)[i], st_geometry(tree_manuel)[j])
+    }))
+  }
+  
+  # Calcul des IoU pour tree_SAM
+  cat("Calcul IoU pour SAM...\n")
+  tree_SAM_plot$best_iou <- foreach(i = 1:nrow(tree_SAM_plot), .combine = c, .packages = 'sf') %dopar% {
+    max(sapply(1:nrow(tree_manuel), function(j) {
+      calculate_iou(st_geometry(tree_SAM_plot)[i], st_geometry(tree_manuel)[j])
+    }))
+  }
+  
+  # Calcul des IoU pour tree_d2s
+  cat("Calcul IoU pour d2s...\n")
+  tree_d2s_plot$best_iou <- foreach(i = 1:nrow(tree_d2s_plot), .combine = c, .packages = 'sf') %dopar% {
+    max(sapply(1:nrow(tree_manuel), function(j) {
+      calculate_iou(st_geometry(tree_d2s_plot)[i], st_geometry(tree_manuel)[j])
+    }))
+  }
+  
+  # Calcul des IoU pour tree_manuel par rapport aux autres méthodes
+  cat("Calcul IoU pour tree_manuel vs detectree...\n")
+  tree_manuel$best_iou_detectree <- foreach(i = 1:nrow(tree_manuel), .combine = c, .packages = 'sf') %dopar% {
+    max(sapply(1:nrow(tree_detectree_plot), function(j) {
+      calculate_iou(st_geometry(tree_manuel)[i], st_geometry(tree_detectree_plot)[j])
+    }))
+  }
+  
+  cat("Calcul IoU pour tree_manuel vs SAM...\n")
+  tree_manuel$best_iou_SAM <- foreach(i = 1:nrow(tree_manuel), .combine = c, .packages = 'sf') %dopar% {
+    max(sapply(1:nrow(tree_SAM_plot), function(j) {
+      calculate_iou(st_geometry(tree_manuel)[i], st_geometry(tree_SAM_plot)[j])
+    }))
+  }
+  
+  cat("Calcul IoU pour tree_manuel vs d2s...\n")
+  tree_manuel$best_iou_d2s <- foreach(i = 1:nrow(tree_manuel), .combine = c, .packages = 'sf') %dopar% {
+    max(sapply(1:nrow(tree_d2s_plot), function(j) {
+      calculate_iou(st_geometry(tree_manuel)[i], st_geometry(tree_d2s_plot)[j])
+    }))
+  }
+  
+  # Sauvegarder les IoU calculés
+  iou_data <- list(
+    tree_detectree_plot = tree_detectree_plot,
+    tree_SAM_plot = tree_SAM_plot,
+    tree_d2s_plot = tree_d2s_plot,
+    tree_manuel = tree_manuel
+  )
+  saveRDS(iou_data, file.path(CHECKPOINT_DIR, "iou_calculated.rds"))
+  cat("IoU calculés et sauvegardés\n")
+}
+
+# Ajouter une colonne "plot_name" pour chaque arbre
+tree_detectree_plot <- st_join(tree_detectree_plot, plots[, c("Nom")], join = st_intersects)
+tree_SAM_plot <- st_join(tree_SAM_plot, plots[, c("Nom")], join = st_intersects)
+tree_d2s_plot <- st_join(tree_d2s_plot, plots[, c("Nom")], join = st_intersects)
+tree_manuel <- st_join(tree_manuel, plots[, c("Nom")], join = st_intersects)
+```
+
+## Validation par polygone
+
+Cette section effectue un bootstrap pour estimer les F1, TPR et PRC pour chaque méthode (Detectree, SAM, d2s) à partir des IoU.
+
+```{r validation-polygon, message=TRUE}
+
+# Fonction pour calculer les métriques (F1, TPR, PRC)
+calculate_metrics <- function(tp, fp, fn) {
+  F1  <- ifelse((2 * tp + fp + fn) == 0, 0, 2 * tp / (2 * tp + fp + fn))
+  TPR <- ifelse((tp + fn) == 0, 0, tp / (tp + fn))
+  PRC <- ifelse((tp + fp) == 0, 0, tp / (tp + fp))
+  c(F1 = F1, TPR = TPR, PRC = PRC)
+}
+
+n_bootstrap <- 1000
+set.seed(123)
+
+# Vérifier si le bootstrap polygone a déjà été fait
+if (file.exists(file.path(CHECKPOINT_DIR, "bootstrap_polygon_results.rds"))) {
+  cat("Chargement des résultats bootstrap polygone...\n")
+  bootstrap_results <- readRDS(file.path(CHECKPOINT_DIR, "bootstrap_polygon_results.rds"))
+} else {
+  cat("Début du bootstrap polygone...\n")
+  
+  clusterExport(cl, list("tree_detectree_plot","tree_SAM_plot","tree_d2s_plot","tree_manuel","positive_tresh","calculate_metrics"))
+  
+  bootstrap_results <- foreach(i = 1:n_bootstrap, .combine = rbind) %dopar% {
+    set.seed(123 + i)
+    
+    resample_detectree <- sample(1:nrow(tree_detectree_plot), replace = TRUE)
+    TP_detectree <- sum(tree_detectree_plot$best_iou[resample_detectree] > positive_tresh)
+    FP_detectree <- sum(tree_detectree_plot$best_iou[resample_detectree] <= positive_tresh)
+    
+    resample_manuel <- sample(1:nrow(tree_manuel), replace = TRUE)
+    FN_detectree <- sum(tree_manuel$best_iou_detectree[resample_manuel] <= positive_tresh)
+    metrics_detectree <- calculate_metrics(TP_detectree, FP_detectree, FN_detectree)
+    
+    # SAM
+    resample_SAM <- sample(1:nrow(tree_SAM_plot), replace = TRUE)
+    TP_SAM <- sum(tree_SAM_plot$best_iou[resample_SAM] > positive_tresh)
+    FP_SAM <- sum(tree_SAM_plot$best_iou[resample_SAM] <= positive_tresh)
+    FN_SAM <- sum(tree_manuel$best_iou_SAM[resample_manuel] <= positive_tresh)
+    metrics_SAM <- calculate_metrics(TP_SAM, FP_SAM, FN_SAM)
+    
+    # d2s
+    resample_d2s <- sample(1:nrow(tree_d2s_plot), replace = TRUE)
+    TP_d2s <- sum(tree_d2s_plot$best_iou[resample_d2s] > positive_tresh)
+    FP_d2s <- sum(tree_d2s_plot$best_iou[resample_d2s] <= positive_tresh)
+    FN_d2s <- sum(tree_manuel$best_iou_d2s[resample_manuel] <= positive_tresh)
+    metrics_d2s <- calculate_metrics(TP_d2s, FP_d2s, FN_d2s)
+    
+    c(metrics_detectree, metrics_SAM, metrics_d2s)
+  }
+  
+  bootstrap_results <- as.data.frame(bootstrap_results)
+  colnames(bootstrap_results) <- c("F1_detectree","TPR_detectree","PRC_detectree",
+                                   "F1_SAM","TPR_SAM","PRC_SAM",
+                                   "F1_d2s","TPR_d2s","PRC_d2s")
+  
+  saveRDS(bootstrap_results, file.path(CHECKPOINT_DIR, "bootstrap_polygon_results.rds"))
+}
+
+# Calcul IC et moyenne
+IC_polygon   <- apply(bootstrap_results, 2, quantile, probs = c(0.025, 0.975))
+mean_polygon <- colMeans(bootstrap_results)
+
+
+```
+
+## Validation par pixel
+
+Ici, on rasterise les polygones et on effectue un bootstrap **pixel par pixel**, afin d’avoir une validation plus fine.
+
+```{r validation-pixel, message=TRUE}
+if (file.exists(file.path(CHECKPOINT_DIR, "raster_matrices.rds"))) {
+  cat("Chargement des matrices raster...\n")
+  raster_data <- readRDS(file.path(CHECKPOINT_DIR, "raster_matrices.rds"))
+  list2env(raster_data, envir = .GlobalEnv)
+} else {
+  cat("Création des matrices raster...\n")
+  r <- raster()
+  projection(r) <- projection(luki_tif)
+  ext <- st_bbox(plot_combined)
+  res(r) <- 0.10
+  extent(r) <- ext
+  r[] <- 0
+  
+  tree_manuel_sp <- as(tree_manuel[!st_is_empty(tree_manuel), ], "Spatial")
+  tree_detectree_sp <- as(tree_detectree_plot[!st_is_empty(tree_detectree_plot), ], "Spatial")
+  tree_SAM_sp <- as(tree_SAM_plot[!st_is_empty(tree_SAM_plot), ], "Spatial")
+  tree_d2s_sp <- as(tree_d2s_plot[!st_is_empty(tree_d2s_plot), ], "Spatial")
+  
+  tree_manuel_r_mask <- rasterize(tree_manuel_sp, r, field = 1, background = 0)
+  tree_detectree_r_mask <- rasterize(tree_detectree_sp, r, field = 1, background = 0)
+  tree_SAM_r_mask <- rasterize(tree_SAM_sp, r, field = 1, background = 0)
+  tree_d2s_r_mask <- rasterize(tree_d2s_sp, r, field = 1, background = 0)
+  
+  tree_manuel_matrix <- as.matrix(tree_manuel_r_mask)
+  tree_detectree_matrix <- as.matrix(tree_detectree_r_mask)
+  tree_SAM_matrix <- as.matrix(tree_SAM_r_mask)
+  tree_d2s_matrix <- as.matrix(tree_d2s_r_mask)
+  
+  valid_indices <- which(!is.na(tree_manuel_matrix))
+  
+  raster_data <- list(
+    tree_manuel_matrix = tree_manuel_matrix,
+    tree_detectree_matrix = tree_detectree_matrix,
+    tree_SAM_matrix = tree_SAM_matrix,
+    tree_d2s_matrix = tree_d2s_matrix,
+    valid_indices = valid_indices
+  )
+  saveRDS(raster_data, file.path(CHECKPOINT_DIR, "raster_matrices.rds"))
+}
+
+calculate_metrics_pixel <- function(truth, prediction) {
+  TP <- sum(truth == 1 & prediction == 1)
+  FP <- sum(truth == 0 & prediction == 1)
+  FN <- sum(truth == 1 & prediction == 0)
+  F1  <- ifelse((2*TP+FP+FN)==0,0,2*TP/(2*TP+FP+FN))
+  TPR <- ifelse((TP+FN)==0,0,TP/(TP+FN))
+  PRC <- ifelse((TP+FP)==0,0,TP/(TP+FP))
+  c(F1=F1,TPR=TPR,PRC=PRC)
+}
+
+if (file.exists(file.path(CHECKPOINT_DIR, "bootstrap_pixel_results.rds"))) {
+  bootstrap_results_pixel <- readRDS(file.path(CHECKPOINT_DIR, "bootstrap_pixel_results.rds"))
+} else {
+  cat("Début du bootstrap pixel...\n")
+  n_bootstrap <- 1000
+  bootstrap_results_pixel <- foreach(i=1:n_bootstrap, .combine = rbind) %dopar% {
+    set.seed(123+i)
+    sampled <- sample(valid_indices, length(valid_indices), replace=TRUE)
+    truth <- tree_manuel_matrix[sampled]
+    pred_detectree <- tree_detectree_matrix[sampled]
+    pred_SAM <- tree_SAM_matrix[sampled]
+    pred_d2s <- tree_d2s_matrix[sampled]
+    
+    c(calculate_metrics_pixel(truth, pred_detectree),
+      calculate_metrics_pixel(truth, pred_SAM),
+      calculate_metrics_pixel(truth, pred_d2s))
+  }
+  
+  bootstrap_results_pixel <- as.data.frame(bootstrap_results_pixel)
+  colnames(bootstrap_results_pixel) <- c("F1_detectree","TPR_detectree","PRC_detectree",
+                                         "F1_SAM","TPR_SAM","PRC_SAM",
+                                         "F1_d2s","TPR_d2s","PRC_d2s")
+  saveRDS(bootstrap_results_pixel, file.path(CHECKPOINT_DIR, "bootstrap_pixel_results.rds"))
+}
+
+mean_metrics_pixel <- colMeans(bootstrap_results_pixel)
+quantile_metrics_pixel <- apply(bootstrap_results_pixel, 2, quantile, probs = c(0.025, 0.975))
+
+results_table_pixel <- data.frame(
+  Méthode = rep(c("Detectree","SAM","d2s"), each=3),
+  Métrique = rep(c("F1","TPR","PRC"), times=3),
+  Moyenne = mean_metrics_pixel,
+  IC_2.5 = quantile_metrics_pixel[1,],
+  IC_97.5 = quantile_metrics_pixel[2,]
+)
+
+```
+
+## Rendu final
+
+Les résultats sont affichés sous forme de **tableaux propres** grâce à `kable` et `kableExtra`.
+
+```{r resultats-final, message=FALSE}
+# Résumé des résultats polygone
+polygon_results_table <- data.frame(
+  Méthode = rep(c("Detectree","SAM","d2s"), each = 3),
+  Métrique = rep(c("F1","TPR","PRC"), times = 3),
+  Moyenne = as.numeric(mean_polygon),
+  IC_2.5 = as.numeric(IC_polygon[1, ]),
+  IC_97.5 = as.numeric(IC_polygon[2, ])
+)
+
+# Tableau des résultats polygone
+kable(polygon_results_table, format = "html", digits = 3,
+      caption = "Validation par polygone - Moyennes et intervalles de confiance à 95%") %>%
+  kable_styling(full_width = FALSE, position = "center", bootstrap_options = c("striped", "hover", "condensed"))
+
+# Tableau des résultats pixel
+kable(results_table_pixel, format = "html", digits = 3,
+      caption = "Validation par pixel - Moyennes et intervalles de confiance à 95%") %>%
+  kable_styling(full_width = FALSE, position = "center", bootstrap_options = c("striped", "hover", "condensed"))
+```
+
+# 2. Spatial and quantitative comparison of derived metrics at plot scale
+
+## Sélection des 20 plus grands arbres par méthode
+
+> **Remarque méthodologique :**\
+> Nous excluons ici la parcelle **Pheno2** car elle ne possède pas de relevé terrain,\
+> et la parcelle **Parc6** car elle contient un outlier (un arbre de 2065 m²),\
+> beaucoup plus grand que tout autre arbre de Luki et qui biaiserait les résultats.
+
+```{r top20-by-plot, message=FALSE}
+
+# --- Filtrer les parcelles (exclure Pheno2 et Parc6) ---
+plots_filtered_top20 <- plots[!plots$Nom %in% c("Pheno2", "Parc6"), ]
+
+# Jointure spatiale pour récupérer l'attribut 'Nom' des parcelles
+detectree_top <- st_join(tree_detectree_plot, plots_filtered_top20, join = st_intersects)
+SAM_top       <- st_join(tree_SAM_plot, plots_filtered_top20, join = st_intersects)
+d2s_top       <- st_join(tree_d2s_plot, plots_filtered_top20, join = st_intersects)
+
+# --- Sélection des 20 plus grands arbres PAR PARCELLE ---
+top20_detectree <- detectree_top %>%
+  st_drop_geometry() %>%
+  group_by(Nom) %>%
+  slice_max(order_by = area_m2, n = 20, with_ties = FALSE)
+
+top20_SAM <- SAM_top %>%
+  st_drop_geometry() %>%
+  group_by(Nom) %>%
+  slice_max(order_by = area_m2, n = 20, with_ties = FALSE)
+
+top20_d2s <- d2s_top %>%
+  st_drop_geometry() %>%
+  group_by(Nom) %>%
+  slice_max(order_by = area_m2, n = 20, with_ties = FALSE)
+
+# --- Filtrage de l'inventaire terrain pour enlever Parc6 ---
+field_inventory_filtered <- field_inventory[field_inventory$Nom != "Parc6", ]
+# Vérification : nombre de lignes par parcelle
+table(top20_detectree$Nom)
+table(top20_SAM$Nom)
+table(top20_d2s$Nom)
+table(field_inventory_filtered$Nom)
+```
+
+## Calcul des statistiques de structure par parcelle
+
+> Ici, nous dérivons pour chaque parcelle :\
+> - **médiane d'aire des 20 plus grands arbres**\
+> - **somme d'aire des 20 plus grands arbres**\
+> puis nous comparons les résultats des trois méthodes aux données terrain en calculant RMSE (RMSE%) et R².
+
+```{r plots-med-sum, message=FALSE}
+
+# ---- Préparer les stats par parcelle ----
+stats_field <- field_inventory_filtered %>%
+  group_by(Nom) %>%
+  summarise(median_area = median(area_m2, na.rm = TRUE),
+            sum_area = sum(area_m2, na.rm = TRUE),
+            median_SI = median(SI, na.rm = TRUE))
+
+stats_detectree <- top20_detectree %>%
+  group_by(Nom) %>%
+  summarise(median_area = median(area_m2, na.rm = TRUE),
+            sum_area = sum(area_m2, na.rm = TRUE),
+            median_SI = median(SI, na.rm = TRUE))
+
+stats_SAM <- top20_SAM %>%
+  group_by(Nom) %>%
+  summarise(median_area = median(area_m2, na.rm = TRUE),
+            sum_area = sum(area_m2, na.rm = TRUE),
+            median_SI = median(SI, na.rm = TRUE))
+
+stats_d2s <- top20_d2s %>%
+  group_by(Nom) %>%
+  summarise(median_area = median(area_m2, na.rm = TRUE),
+            sum_area = sum(area_m2, na.rm = TRUE),
+            median_SI = median(SI, na.rm = TRUE))
+
+# ---- Fusionner en un seul df pour les plots ----
+df_Med_Aire <- stats_field %>%
+  dplyr::rename(arbres = median_area) %>%
+  dplyr::left_join(stats_detectree %>% dplyr::select(Nom, tree_detectree = median_area), by = "Nom") %>%
+  dplyr::left_join(stats_SAM %>% dplyr::select(Nom, tree_SAM = median_area), by = "Nom") %>%
+  dplyr::left_join(stats_d2s %>% dplyr::select(Nom, tree_d2s = median_area), by = "Nom")
+
+
+df_sum_Aire <- stats_field %>%
+  dplyr::rename(arbres = sum_area) %>%
+  dplyr::left_join(stats_detectree %>% dplyr::select(Nom, tree_detectree = sum_area), by="Nom") %>%
+  dplyr::left_join(stats_SAM %>% dplyr::select(Nom, tree_SAM = sum_area), by="Nom") %>%
+  dplyr::left_join(stats_d2s %>% dplyr::select(Nom, tree_d2s = sum_area), by="Nom")
+
+df_Med_SI <- stats_field %>%
+  dplyr::rename(arbres = median_SI) %>%
+  dplyr::left_join(stats_detectree %>% dplyr::select(Nom, tree_detectree = median_SI), by="Nom") %>%
+  dplyr::left_join(stats_SAM %>% dplyr::select(Nom, tree_SAM = median_SI), by="Nom") %>%
+  dplyr::left_join(stats_d2s %>% dplyr::select(Nom, tree_d2s = median_SI), by="Nom")
+
+# ---- Fonction pour calculer R² et RMSE ----
+rmse <- function(obs, pred) sqrt(mean((obs - pred)^2, na.rm = TRUE))
+r2 <- function(obs, pred) summary(lm(pred ~ obs))$r.squared
+
+# ---- Calcul R² et RMSE pour les trois méthodes (median area) ----
+r2_Med_Aire_D2  <- r2(df_Med_Aire$arbres, df_Med_Aire$tree_detectree)
+rmsd_Med_Aire_D2 <- rmse(df_Med_Aire$arbres, df_Med_Aire$tree_detectree)
+rmsd_Med_Aire_D2_pct <- (rmsd_Med_Aire_D2 / mean(df_Med_Aire$arbres)) * 100
+
+r2_Med_Aire_SAM <- r2(df_Med_Aire$arbres, df_Med_Aire$tree_SAM)
+rmsd_Med_Aire_SAM <- rmse(df_Med_Aire$arbres, df_Med_Aire$tree_SAM)
+rmsd_Med_Aire_SAM_pct <- (rmsd_Med_Aire_SAM / mean(df_Med_Aire$arbres)) * 100
+
+r2_Med_Aire_D2S <- r2(df_Med_Aire$arbres, df_Med_Aire$tree_d2s)
+rmsd_Med_Aire_D2S <- rmse(df_Med_Aire$arbres, df_Med_Aire$tree_d2s)
+rmsd_Med_Aire_D2S_pct <- (rmsd_Med_Aire_D2S / mean(df_Med_Aire$arbres)) * 100
+
+# ---- Calcul R² et RMSE pour les trois méthodes (sum area) ----
+r2_Sum_Aire_D2  <- r2(df_sum_Aire$arbres, df_sum_Aire$tree_detectree)
+rmsd_Sum_Aire_D2 <- rmse(df_sum_Aire$arbres, df_sum_Aire$tree_detectree)
+rmsd_Sum_Aire_D2_pct <- (rmsd_Sum_Aire_D2 / mean(df_sum_Aire$arbres)) * 100
+
+r2_Sum_Aire_SAM <- r2(df_sum_Aire$arbres, df_sum_Aire$tree_SAM)
+rmsd_Sum_Aire_SAM <- rmse(df_sum_Aire$arbres, df_sum_Aire$tree_SAM)
+rmsd_Sum_Aire_SAM_pct <- (rmsd_Sum_Aire_SAM / mean(df_sum_Aire$arbres)) * 100
+
+r2_Sum_Aire_D2S <- r2(df_sum_Aire$arbres, df_sum_Aire$tree_d2s)
+rmsd_Sum_Aire_D2S <- rmse(df_sum_Aire$arbres, df_sum_Aire$tree_d2s)
+rmsd_Sum_Aire_D2S_pct <- (rmsd_Sum_Aire_D2S / mean(df_sum_Aire$arbres)) * 100
+
+# ---- Calcul R² et RMSE pour les trois méthodes (median SI) ----
+r2_Med_SI_D2  <- r2(df_Med_SI$arbres, df_Med_SI$tree_detectree)
+rmsd_Med_SI_D2 <- rmse(df_Med_SI$arbres, df_Med_SI$tree_detectree)
+rmsd_Med_SI_D2_pct <- (rmsd_Med_SI_D2 / mean(df_Med_SI$arbres)) * 100
+
+r2_Med_SI_SAM <- r2(df_Med_SI$arbres, df_Med_SI$tree_SAM)
+rmsd_Med_SI_SAM <- rmse(df_Med_SI$arbres, df_Med_SI$tree_SAM)
+rmsd_Med_SI_SAM_pct <- (rmsd_Med_SI_SAM / mean(df_Med_SI$arbres)) * 100
+
+r2_Med_SI_D2S <- r2(df_Med_SI$arbres, df_Med_SI$tree_d2s)
+rmsd_Med_SI_D2S <- rmse(df_Med_SI$arbres, df_Med_SI$tree_d2s)
+rmsd_Med_SI_D2S_pct <- (rmsd_Med_SI_D2S / mean(df_Med_SI$arbres)) * 100
+# Créer un tableau avec tous les résultats
+table_r2_rmse <- tibble(
+  Méthode = c("Detectree", "SAM", "D2S"),
+  `R² Médiane` = c(r2_Med_Aire_D2, r2_Med_Aire_SAM, r2_Med_Aire_D2S),
+  `RMSE Médiane` = c(rmsd_Med_Aire_D2, rmsd_Med_Aire_SAM, rmsd_Med_Aire_D2S),
+  `%RMSE Médiane` = c(rmsd_Med_Aire_D2_pct, rmsd_Med_Aire_SAM_pct, rmsd_Med_Aire_D2S_pct),
+  `R² Somme` = c(r2_Sum_Aire_D2, r2_Sum_Aire_SAM, r2_Sum_Aire_D2S),
+  `RMSE Somme` = c(rmsd_Sum_Aire_D2, rmsd_Sum_Aire_SAM, rmsd_Sum_Aire_D2S),
+  `%RMSE Somme` = c(rmsd_Sum_Aire_D2_pct, rmsd_Sum_Aire_SAM_pct, rmsd_Sum_Aire_D2S_pct),
+  `R² Médiane SI` = c(r2_Med_SI_D2, r2_Med_SI_SAM, r2_Med_SI_D2S),
+  `RMSE Médiane SI` = c(rmsd_Med_SI_D2, rmsd_Med_SI_SAM, rmsd_Med_SI_D2S),
+  `%RMSE Médiane SI` = c(rmsd_Med_SI_D2_pct, rmsd_Med_SI_SAM_pct, rmsd_Med_SI_D2S_pct)
+)
+
+# Afficher le tableau joliment
+kable(table_r2_rmse, digits = 3, caption = "Comparaison des performances (Médiane vs Somme)")
+
+
+```
+
+## Calcul des statistiques de structure par parcelle
+
+> Ici, nous dérivons pour chaque parcelle :\
+> - **médiane d'aire des 20 plus grands arbres**\
+> - **somme d'aire des 20 plus grands arbres**\
+> puis nous comparons les résultats des trois méthodes aux données terrain en calculant RMSE (RMSE%) et R².
+
+```{r density-per-ha, message=FALSE}
+
+# --- Filtrer la photointerprétation et les segmentations ---
+photointerpretation_inventory_filtered <- photointerpretation_inventory[!photointerpretation_inventory$Nom %in% c("Pheno2", "Parc6"), ]
+
+# Jointure spatiale pour récupérer l'attribut 'Nom' des parcelles
+tree_detectree_plot_density  <- st_join(tree_detectree_plot, plots_filtered_top20, join = st_intersects)
+tree_SAM_plot_density        <- st_join(tree_SAM_plot, plots_filtered_top20, join = st_intersects)
+tree_d2s_plot_density        <- st_join(tree_d2s_plot, plots_filtered_top20, join = st_intersects)
+
+# --- Calculer surface (ha) de chaque parcelle ---
+plots_area <- plot_filtered %>%
+  filter(!Nom %in% c("Pheno2", "Parc6")) %>%
+  dplyr::select(Nom, Aire)
+
+# --- Calculer le nombre d'individus par parcelle ---
+dens_field <- photointerpretation_inventory_filtered %>%
+  st_drop_geometry() %>%
+  filter(!is.na(Nom)) %>%
+  group_by(Nom) %>%
+  summarise(count = n()) %>%
+  left_join(plots_area, by = "Nom") %>%
+  mutate(density_ha = count / Aire)
+
+dens_detectree <- tree_detectree_plot_density %>%
+  st_drop_geometry() %>%
+  filter(!is.na(Nom)) %>%
+  group_by(Nom) %>%
+  summarise(count = n()) %>%
+  left_join(plots_area, by = "Nom") %>%
+  mutate(density_ha = count / Aire)
+
+dens_SAM <- tree_SAM_plot_density %>%
+  st_drop_geometry() %>%
+  filter(!is.na(Nom)) %>%
+  group_by(Nom) %>%
+  summarise(count = n()) %>%
+  left_join(plots_area, by = "Nom") %>%
+  mutate(density_ha = count / Aire)
+
+dens_d2s <- tree_d2s_plot_density %>%
+  st_drop_geometry() %>%
+  filter(!is.na(Nom)) %>%
+  group_by(Nom) %>%
+  summarise(count = n()) %>%
+  left_join(plots_area, by = "Nom") %>%
+  mutate(density_ha = count / Aire)
+
+# --- Fusionner pour les plots ---
+df_density <- dens_field %>%
+  dplyr::select(Nom, arbres = density_ha) %>%
+  dplyr::left_join(dens_detectree %>% dplyr::select(Nom, tree_detectree = density_ha), by="Nom") %>%
+  dplyr::left_join(dens_SAM %>% dplyr::select(Nom, tree_SAM = density_ha), by="Nom") %>%
+  dplyr::left_join(dens_d2s %>% dplyr::select(Nom, tree_d2s = density_ha), by="Nom")
+
+# --- Calculer R² et RMSE ---
+r2_density_D2  <- r2(df_density$arbres, df_density$tree_detectree)
+rmse_density_D2 <- rmse(df_density$arbres, df_density$tree_detectree)
+rmsd_density_D2_pct <- (rmse_density_D2 / mean(df_density$arbres)) * 100
+
+r2_density_SAM <- r2(df_density$arbres, df_density$tree_SAM)
+rmse_density_SAM <- rmse(df_density$arbres, df_density$tree_SAM)
+rmsd_density_SAM_pct <- (rmse_density_SAM / mean(df_density$arbres)) * 100
+
+r2_density_D2S <- r2(df_density$arbres, df_density$tree_d2s)
+rmse_density_D2S <- rmse(df_density$arbres, df_density$tree_d2s)
+rmsd_density_D2S_pct <- (rmse_density_D2S / mean(df_density$arbres)) * 100
+
+# Créer un tableau pour les résultats de densité
+table_r2_rmse_density <- tibble(
+  Méthode = c("Detectree", "SAM", "D2S"),
+  `R² Densité` = c(r2_density_D2, r2_density_SAM, r2_density_D2S),
+  `RMSE Densité` = c(rmse_density_D2, rmse_density_SAM, rmse_density_D2S),
+  `%RMSE Densité` = c(rmsd_density_D2_pct, rmsd_density_SAM_pct, rmsd_density_D2S_pct)
+)
+
+# Affichage clair
+kable(table_r2_rmse_density, digits = 3, caption = "Performances pour la densité (arbres/ha)")
+```
+
+## Visualisation conjointe des résultats à l’échelle des parcelles
+
+> Les trois indicateurs (médiane, somme et densité) sont visualisés sous forme de graphiques de dispersion,\
+> avec une ligne 1:1 et les valeurs de R² / RMSE annotées pour chaque méthode.
+
+```{r plots-at-plots- scale, message=FALSE}
+# ---- Plot MEDIAN AREA ----
+plot_med_Aire <- ggplot(df_Med_Aire, aes()) + 
+  geom_point(aes(y = arbres, x = tree_detectree), color = '#33CCCC', alpha = 0.6) + 
+  geom_smooth(aes(y = arbres, x = tree_detectree), method = "lm", color = '#33CCCC', linetype = "solid", se = FALSE) +
+  geom_point(aes(y = arbres, x = tree_SAM), color = '#CC33CC', alpha = 0.6) + 
+  geom_smooth(aes(y = arbres, x = tree_SAM), method = "lm", color = '#CC33CC', linetype = "solid", se = FALSE) +
+  geom_point(aes(y = arbres, x = tree_d2s), color = '#CCAA00', alpha = 0.6) + 
+  geom_smooth(aes(y = arbres, x = tree_d2s), method = "lm", color = '#CCAA00', linetype = "solid", se = FALSE) +
+  geom_abline(slope = 1, linetype = 2, alpha = 0.6, size = 0.5) +
+  coord_fixed(ratio = 1, xlim = c(100, 400), ylim = c(100, 400)) +
+  theme_classic() +
+  annotate("text", x = 90, y = 400*0.98,
+           label = paste0("Detectree2 – R² : ", round(r2_Med_Aire_D2, 2),
+                          " ; RMSE : ", round(rmsd_Med_Aire_D2, 2), " m² (",
+                          round(rmsd_Med_Aire_D2_pct, 1), "%)"),
+           color = '#33CCCC', size = 4, hjust = 0) +
+  annotate("text", x = 90, y = 400*0.94,
+           label = paste0("SAM – R² : ", round(r2_Med_Aire_SAM, 2),
+                          " ; RMSE : ", round(rmsd_Med_Aire_SAM, 2), " m² (",
+                          round(rmsd_Med_Aire_SAM_pct, 1), "%)"),
+           color = '#CC33CC', size = 4, hjust = 0) +
+  annotate("text", x = 90, y = 400*0.90,
+           label = paste0("D2S – R² : ", round(r2_Med_Aire_D2S, 2),
+                          " ; RMSE : ", round(rmsd_Med_Aire_D2S, 2), " m² (",
+                          round(rmsd_Med_Aire_D2S_pct, 1), "%)"),
+           color = '#CCAA00', size = 4, hjust = 0) +
+  labs(x = "Median Area ITC models of the 20 largest \ntree crowns per hectare (m²)",
+       y = "Median Area field of the 20 largest \ntree crowns per hectare (m²)") +
+  theme(plot.title = element_text(size = 12))
+
+# ---- Plot SUM AREA ----
+plot_sum_Aire <- ggplot(df_sum_Aire, aes()) + 
+  geom_point(aes(y = arbres, x = tree_detectree), color = '#33CCCC', alpha = 0.6) + 
+  geom_smooth(aes(y = arbres, x = tree_detectree), method = "lm", color = '#33CCCC', linetype = "solid", se = FALSE) +
+  geom_point(aes(y = arbres, x = tree_SAM), color = '#CC33CC', alpha = 0.6) + 
+  geom_smooth(aes(y = arbres, x = tree_SAM), method = "lm", color = '#CC33CC', linetype = "solid", se = FALSE) +
+  geom_point(aes(y = arbres, x = tree_d2s), color = '#CCAA00', alpha = 0.6) + 
+  geom_smooth(aes(y = arbres, x = tree_d2s), method = "lm", color = '#CCAA00', linetype = "solid", se = FALSE) +
+  geom_abline(slope = 1, linetype = 2, alpha = 0.6, size = 0.5) +
+  coord_fixed(ratio = 1, xlim = c(3100, 9200), ylim = c(3100, 9200)) +
+  theme_classic() +
+  annotate("text", x = 2900, y = 9200*0.98,
+           label = paste0("Detectree2 – R² : ", round(r2_Sum_Aire_D2, 2),
+                          " ; RMSE : ", round(rmsd_Sum_Aire_D2, 2), " m² (",
+                          round(rmsd_Sum_Aire_D2_pct, 1), "%)"),
+           color = '#33CCCC', size = 4, hjust = 0) +
+  annotate("text", x = 2900, y = 9200*0.94,
+           label = paste0("SAM – R² : ", round(r2_Sum_Aire_SAM, 2),
+                          " ; RMSE : ", round(rmsd_Sum_Aire_SAM, 2), " m² (",
+                          round(rmsd_Sum_Aire_SAM_pct, 1), "%)"),
+           color = '#CC33CC', size = 4, hjust = 0) +
+  annotate("text", x = 2900, y = 9200*0.90,
+           label = paste0("D2S – R² : ", round(r2_Sum_Aire_D2S, 2),
+                          " ; RMSE : ", round(rmsd_Sum_Aire_D2S, 2), " m² (",
+                          round(rmsd_Sum_Aire_D2S_pct, 1), "%)"),
+           color = '#CCAA00', size = 4, hjust = 0) +
+  labs(x = "Sum Area ITC models of the 20 largest \ntree crowns per hectare (m²)",
+       y = "Sum Area field of the 20 largest \ntree crowns per hectare (m²)") +
+  theme(plot.title = element_text(size = 12))
+plot_sum_Aire
+# ---- Plot DENSITY ----
+plot_density <- ggplot(df_density, aes()) + 
+  geom_point(aes(y = arbres, x = tree_detectree), color = '#33CCCC', alpha = 0.6) + 
+  geom_smooth(aes(y = arbres, x = tree_detectree), method = "lm", color = '#33CCCC', linetype = "solid", se = FALSE) +
+  geom_point(aes(y = arbres, x = tree_SAM), color = '#CC33CC', alpha = 0.6) + 
+  geom_smooth(aes(y = arbres, x = tree_SAM), method = "lm", color = '#CC33CC', linetype = "solid", se = FALSE) +
+  geom_point(aes(y = arbres, x = tree_d2s), color = '#CCAA00', alpha = 0.6) + 
+  geom_smooth(aes(y = arbres, x = tree_d2s), method = "lm", color = '#CCAA00', linetype = "solid", se = FALSE) +
+  geom_abline(slope = 1, linetype = 2, alpha = 0.6, size = 0.5) +
+  coord_fixed(ratio = 1, xlim = c(25, 200), ylim = c(25, 200)) +
+  theme_classic() +
+  annotate("text", x = 20, y = 198,
+           label = paste0("Detectree2 – R² : ", round(r2_density_D2, 2),
+                          " ; RMSE : ", round(rmse_density_D2, 1), " ind./ha (",
+                          round(rmsd_density_D2_pct, 1), "%)"),
+           color = '#33CCCC', size = 4, hjust = 0) +
+  annotate("text", x = 20, y = (198+175)/2,
+           label = paste0("SAM – R² : ", round(r2_density_SAM, 2),
+                          " ; RMSE : ", round(rmse_density_SAM, 1), " ind./ha (",
+                          round(rmsd_density_SAM_pct, 1), "%)"),
+           color = '#CC33CC', size = 4, hjust = 0) +
+  annotate("text", x = 20, y = 175,
+           label = paste0("D2S – R² : ", round(r2_density_D2S, 2),
+                          " ; RMSE : ", round(rmse_density_D2S, 1), " ind./ha (",
+                          round(rmsd_density_D2S_pct, 1), "%)"),
+           color = '#CCAA00', size = 4, hjust = 0) +
+  labs(x = "ITC models number of trees\n (ind/plot)",
+       y = "Photointerpretation number\n of trees (ind/plot)") +
+  theme(plot.title = element_text(size = 12))
+# ---- Plot MEDIAN AREA ----
+plot_med_SI <- ggplot(df_Med_SI, aes()) + 
+  geom_point(aes(y = arbres, x = tree_detectree), color = '#33CCCC', alpha = 0.6) + 
+  geom_smooth(aes(y = arbres, x = tree_detectree), method = "lm", color = '#33CCCC', linetype = "solid", se = FALSE) +
+  geom_point(aes(y = arbres, x = tree_SAM), color = '#CC33CC', alpha = 0.6) + 
+  geom_smooth(aes(y = arbres, x = tree_SAM), method = "lm", color = '#CC33CC', linetype = "solid", se = FALSE) +
+  geom_point(aes(y = arbres, x = tree_d2s), color = '#CCAA00', alpha = 0.6) + 
+  geom_smooth(aes(y = arbres, x = tree_d2s), method = "lm", color = '#CCAA00', linetype = "solid", se = FALSE) +
+  geom_abline(slope = 1, linetype = 2) +
+  coord_fixed(ratio = 1, xlim = c(0.6, 1), ylim = c(0.6, 1)) +
+  theme_classic() +
+  annotate("text", x = 0.6*1.01, y = 1*0.98,
+           label = paste0("Detectree2 – R² : ", round(r2_Med_SI_D2, 2),
+                          " ; RMSE : ", round(rmsd_Med_SI_D2, 2), " m² (",
+                          round(rmsd_Med_Aire_D2_pct, 1), "%)"),
+           color = '#33CCCC', size = 4, hjust = 0) +
+  annotate("text", x = 0.6*1.01, y = 1*0.94,
+           label = paste0("SAM – R² : ", round(r2_Med_SI_SAM, 2),
+                          " ; RMSE : ", round(rmsd_Med_SI_SAM, 2), " m² (",
+                          round(rmsd_Med_SI_SAM_pct, 1), "%)"),
+           color = '#CC33CC', size = 4, hjust = 0) +
+  annotate("text", x = 0.6*1.01, y = 1*0.90,
+           label = paste0("D2S – R² : ", round(r2_Med_SI_D2S, 2),
+                          " ; RMSE : ", round(rmsd_Med_SI_D2S, 2), " m² (",
+                          round(rmsd_Med_SI_D2S_pct, 1), "%)"),
+           color = '#CCAA00', size = 4, hjust = 0) +
+  labs(x = "Median Area ITC models of the 20 largest \ntree crowns per hectare (m²)",
+       y = "Median Area field of the 20 largest \ntree crowns per hectare (m²)") +
+  theme(plot.title = element_text(size = 12))
+
+# Ligne du haut (A et B)
+top_row <- plot_grid(
+  plot_med_Aire,  # A
+  plot_sum_Aire,  # B
+  ncol = 2,
+  align = "hv",
+  axis = "tb",
+  labels = c("A", "B"),
+  label_size = 14,
+  label_x = 0.05,   # légère marge à gauche
+  label_y = 1       # labels bien en haut
+)
+
+# Plot du bas avec label centré
+bottom_row <- plot_grid(
+  plot_density,
+  labels = "C",
+  label_size = 14,
+  label_x = 0.28,    # <-- centre horizontalement
+  label_y = 1.02       # place en haut du plot
+)
+
+# Assemblage final
+final_plot <- plot_grid(
+  top_row,
+  bottom_row,
+  ncol = 1,
+  rel_heights = c(1, 0.8)  # ajuste la hauteur relative
+)
+
+# Affichage
+final_plot
+
+
+# Affichage
+final_plot
+ggsave(
+  filename = "D:/PhD/Data/Art1_rendu/Graphique/plot_lm.png",
+  plot = final_plot,
+  width = 10,       # largeur en pouces
+  height = 10,     # hauteur en pouces
+  dpi = 300,       # résolution d'impression
+  bg = "white"     # fond noir comme ton plot
+)
+```
+
+# 3. Cartographie des attributs à l’échelle des parcelles
+
+> **Objectif :**\
+> Visualiser spatialement la structure de canopée à travers trois métriques :\
+> - Médiane des aires des couronnes (Med_Aire)\
+> - Somme des aires (sum_Aire)\
+> - Densité d’arbres par hectare (Nb_ind)
+>
+> Ces cartes permettent de comparer visuellement les trois méthodes (Detectree2, SAM et D2S) et d’identifier les différences spatiales.
+
+```{r maps-prep, message = FALSE}
+
+# Fenêtre de visualisation (adapte selon ton site)
+xlim_use <- c(288500, 290500)
+ylim_use <- c(9377000, 9379500)
+
+# ==== 3) Préparation : masque vectoriel et grille ====
+mask_resampled <- resample(mask, luki_tif, method = "bilinear")
+mask_vect <- st_as_sf(as.polygons(mask_resampled, values = TRUE))
+# Créer une grille régulière (résolution 10 m)
+res <- 10
+r   <- rast(nrows = nrow(luki_tif), ncols = ncol(luki_tif), ext = ext(luki_tif), resolution = res)
+values(r) <- 1
+
+# Extraire les centroides de la grille et filtrer selon le masque
+r_pts  <- st_as_sf(as.points(r))
+st_crs(r_pts) <- crs(luki_tif)
+centroid_filtered <- r_pts[st_intersects(r_pts, mask_vect, sparse = FALSE), ]
+centroid_filtered$ID_plot <- seq_len(nrow(centroid_filtered)) - 1L
+
+# Créer les parcelles comme buffers carrés autour des centroides (50 m)
+dist_buffer <- 5 * res
+parcelles   <- st_buffer(centroid_filtered, dist = dist_buffer, endCapStyle = "SQUARE")
+st_crs(parcelles) <- crs(luki_tif)
+```
+
+##Calcul des métriques par modèle
+
+```{r metrique_application_fonction_map}
+# Fonction stats Med & Sum (top 20)
+calc_stats_top20 <- function(arbres_sf, parcelles_sf) {
+  
+  # Associer chaque arbre à une parcelle
+  arbres_parc <- st_join(arbres_sf, parcelles_sf, join = st_intersects) |> 
+    filter(!is.na(ID_plot))
+  
+  # Sélection des 20 plus grands par parcelle
+  top20 <- arbres_parc |> 
+    st_drop_geometry() |> 
+    group_by(ID_plot) |> 
+    slice_max(order_by = area_m2, n = 20, with_ties = FALSE)
+  
+  # Stats
+  top20 |> summarise(
+    Med_Aire = median(area_m2, na.rm = TRUE),
+    sum_Aire = sum(area_m2, na.rm = TRUE),
+    .groups = "drop"
+  )
+}
+
+# Fonction stats Densité (tous les arbres)
+calc_stats_density <- function(arbres_sf, parcelles_sf) {
+  
+  arbres_parc <- st_join(arbres_sf, parcelles_sf, join = st_intersects) |> 
+    filter(!is.na(ID_plot))
+  
+  arbres_parc |> 
+    st_drop_geometry() |> 
+    group_by(ID_plot) |> 
+    summarise(Nb_ind = n(), .groups = "drop")
+}
+
+# Médiane et somme (top 20)
+stats_D2_MedSum  <- calc_stats_top20(Detectree2, parcelles)
+stats_SAM_MedSum <- calc_stats_top20(SAM, parcelles)
+stats_D2S_MedSum <- calc_stats_top20(D2S, parcelles)
+
+# Densité
+stats_D2_Nb  <- calc_stats_density(Detectree2, parcelles)
+stats_SAM_Nb <- calc_stats_density(SAM, parcelles)
+stats_D2S_Nb <- calc_stats_density(D2S, parcelles)
+
+# Joindre aux centroides pour avoir coordonnées
+centro_D2  <- left_join(centroid_filtered, stats_D2_MedSum, by="ID_plot") |> 
+              left_join(stats_D2_Nb,  by="ID_plot")
+centro_SAM <- left_join(centroid_filtered, stats_SAM_MedSum, by="ID_plot") |> 
+              left_join(stats_SAM_Nb, by="ID_plot")
+centro_D2S <- left_join(centroid_filtered, stats_D2S_MedSum, by="ID_plot") |> 
+              left_join(stats_D2S_Nb, by="ID_plot")
+```
+
+##Préparation des dataframes pour ggplot
+
+```{r rasterise, massage=FALSE}
+# Fonction de rasterisation -> dataframe
+to_raster_df <- function(sf_points, field, r_template) {
+  v  <- vect(sf_points)
+  rr <- rasterize(v, r_template, field = field, fun = mean, na.rm = TRUE)
+  crs(rr) <- crs(luki_tif)
+  as.data.frame(rr, xy = TRUE) |>
+    rename(value = 3) |>
+    filter(!is.na(value))
+}
+
+# --- Créer une liste des centroides par modèle ---
+centro_list <- list(
+  D2  = centro_D2,
+  SAM = centro_SAM,
+  D2S = centro_D2S
+)
+
+# Rasters par métrique
+rasters <- lapply(names(centro_list), function(m) {
+  list(
+    Med_Aire = to_raster_df(centro_list[[m]], "Med_Aire", r) |> mutate(Model = m, Metric = "Med_Aire"),
+    sum_Aire = to_raster_df(centro_list[[m]], "sum_Aire", r) |> mutate(Model = m, Metric = "sum_Aire"),
+    Nb_ind   = to_raster_df(centro_list[[m]], "Nb_ind",   r) |> mutate(Model = m, Metric = "Nb_ind")
+  )
+})
+names(rasters) <- names(centro_list)
+
+df_Med <- bind_rows(lapply(rasters, `[[`, "Med_Aire"))
+df_Sum <- bind_rows(lapply(rasters, `[[`, "sum_Aire"))
+df_Nbi <- bind_rows(lapply(rasters, `[[`, "Nb_ind"))
+
+lims_Med <- quantile(df_Med$value, probs = c(0.025, 0.975), na.rm = TRUE)
+lims_Sum <- quantile(df_Sum$value, probs = c(0.025, 0.975), na.rm = TRUE)
+lims_Nbi <- quantile(df_Nbi$value, probs = c(0.025, 0.975), na.rm = TRUE)
+
+# Fonction générique pour un plot sans axe X (sauf si demandé)
+plot_metric <- function(df, title_lab, limits_use, show_x = TRUE) {
+  ggplot(df, aes(x = x, y = y, fill = value)) +
+    geom_raster() +
+    scale_fill_viridis_c(option = "C", limits = limits_use, oob = scales::squish) +
+    facet_grid(. ~ Model) +
+    coord_fixed(ratio = 1, xlim = xlim_use, ylim = ylim_use, expand = FALSE) +
+    labs(
+      x = "Easting (m)",  # toujours présent pour réserver la place
+      y = "Northing (m)",
+      fill = title_lab
+    ) +
+    scale_x_continuous(breaks = seq(288000, 290000, 1000)) +
+    scale_y_continuous(breaks = seq(9377500, 9379500, 1000)) +
+    theme_classic() +
+    theme(
+      panel.background = element_rect(fill = "white"),
+      panel.grid = element_blank(),
+      strip.text = element_blank(),
+      axis.text.x = if (show_x) element_text(angle = 0, hjust = 0.5)
+                    else element_blank(),
+      axis.title.x = if (show_x) element_text()
+                     else element_blank()
+    )
+}
+# --- Ajouter les titres de colonnes uniquement sur la première ligne ---
+column_titles <- plot_grid(
+  ggdraw() + draw_label("Detectree2SAM", fontface = "bold", size = 12, x = 0.5, hjust = 0.5),
+  ggdraw() + draw_label("Detectree2SAM", fontface = "bold", size = 12, x = 0.5, hjust = 0.5),
+  ggdraw() + draw_label("SAM", fontface = "bold", size = 12, x = 0.5, hjust = 0.5),
+  ncol = 3
+)
+# Création des trois lignes (seul le dernier montre l'axe X)
+map_Med <- plot_metric(df_Med, "Median \nArea (m²)", lims_Med, show_x = TRUE)
+map_Sum <- plot_metric(df_Sum, "Sum \nArea (m²)",    lims_Sum, show_x = TRUE)
+map_Nbi <- plot_metric(df_Nbi, "Density \n(ind/ha)", lims_Nbi, show_x = TRUE)
+
+
+# Aligner et combiner en panel (sans align_plots)
+panel_viridis <- plot_grid(
+  column_titles,
+  map_Med, map_Sum, map_Nbi,
+  ncol = 1,
+  rel_heights = c(0.05, 1, 1, 1),
+  labels = c("", "A", "B", "C"),
+  label_size = 14,
+  align = "v",
+  axis = "lr"
+)
+
+ggsave(
+  filename = "D:/PhD/Data/Art1_rendu/Graphique/panel_viridis.png",
+  plot = panel_viridis,
+  width = 10,
+  height = 10,
+  dpi = 300,
+  bg = "white"
+)
+```
+
+## Montrer les meilleurs cartes selon les regression
+
+```{r rasterise_select, massage=FALSE}
+# --- Filtrer les dataframes pour ne garder que les modèles et métriques choisis ---
+df_Med_D2S <- df_Med |> filter(Model == "D2S")
+df_Sum_D2S <- df_Sum |> filter(Model == "D2S")
+df_Nbi_SAM <- df_Nbi |> filter(Model == "SAM")
+
+lims_Med_D2S <- quantile(df_Med_D2S$value, probs = c(0.025, 0.975), na.rm = TRUE)
+lims_Sum_D2S <- quantile(df_Sum_D2S$value, probs = c(0.025, 0.975), na.rm = TRUE)
+lims_Nbi_SAM <- quantile(df_Nbi_SAM$value, probs = c(0.025, 0.975), na.rm = TRUE)
+
+# --- Définir une emprise commune avec buffer ---
+all_xy <- bind_rows(
+  df_Med_D2S[, c("x","y")],
+  df_Sum_D2S[, c("x","y")],
+  df_Nbi_SAM[, c("x","y")]
+)
+buf <- 150
+xlim_sel <- range(all_xy$x, na.rm = TRUE) + c(-buf, buf)
+ylim_sel <- range(all_xy$y, na.rm = TRUE) + c(-buf, buf)
+
+# --- Fonction pour créer un plot avec légende interne en bas à droite ---
+plot_metric_single <- function(df, title_lab, limits_use,
+                               xlim_use = xlim_sel, ylim_use = ylim_sel) {
+  ggplot(df, aes(x = x, y = y, fill = value)) +
+    geom_raster() +
+    scale_fill_viridis_c(
+      option = "C",
+      limits = limits_use,
+      oob = scales::squish,
+      guide = guide_colorbar(
+        barheight = unit(40, "pt"),
+        barwidth  = unit(12, "pt"),
+        ticks.colour = "black",
+        title.position = "top"
+      )
+    ) +
+    coord_fixed(ratio = 1, xlim = xlim_use, ylim = ylim_use, expand = FALSE) +
+    labs(x = "Easting (m)", y = "Northing (m)", fill = title_lab) +
+    theme_classic(base_size = 11) +
+    theme(
+      axis.line = element_blank(),
+      panel.background   = element_rect(fill = "white", colour = NA),
+      plot.background    = element_rect(fill = "white", colour = NA),
+      panel.grid         = element_blank(),
+      axis.text          = element_blank(),
+      axis.ticks       = element_blank(),   # supprime les petits traits
+      axis.title         = element_blank(),
+      legend.position    = c(0.98, 0.02),       # <--- en bas à droite
+      legend.justification = c("right", "bottom"),
+      legend.background  = element_rect(fill = "white", colour = "black", size = 0.2),
+      legend.title       = element_blank(),
+      legend.text        = element_text(color = "black", size = 8)
+    )
+}
+
+# --- Créer les 3 cartes avec légendes internes ---
+map_Med_D2S <- plot_metric_single(
+  df_Med_D2S,
+  "Median Crown Area\n(Top 20 / ha, m²)",
+  lims_Med_D2S
+)
+
+map_Sum_D2S <- plot_metric_single(
+  df_Sum_D2S,
+  "Total Crown Area\n(Top 20 / ha, m²)",
+  lims_Sum_D2S
+)
+
+map_Nbi_SAM <- plot_metric_single(
+  df_Nbi_SAM,
+  "Crown Density\n(ind/ha)",
+  lims_Nbi_SAM
+)
+# --- Ligne du haut (A et B) ---
+top_row <- plot_grid(
+  map_Med_D2S,  # A
+  map_Sum_D2S,  # B
+  ncol = 2,
+  align = "hv",
+  axis = "tb",
+  labels = c("A. Detectree2SAM", "B. Detectree2SAM"),
+  label_size = 14,
+  label_x = 0.1,  # petite marge gauche pour les labels
+  label_y = 1      # labels bien en haut
+)
+
+# --- Ligne du bas (C) centrée ---
+bottom_row <- plot_grid(
+  map_Nbi_SAM,
+  labels = "C. SAM",
+  label_size = 14,
+  label_x = 0.35,    # centre horizontalement le label C
+  label_y = 1.02    # le place juste au-dessus de la carte
+)
+
+# --- Combinaison finale ---
+panel_selected_final <- plot_grid(
+  top_row,
+  bottom_row,
+  ncol = 1,
+  rel_heights = c(1, 1)  # ajuste la hauteur de la ligne du bas
+)
+
+# --- Export ---
+ggsave(
+  filename = "D:/PhD/Data/Art1_rendu/Graphique/panel_best_map.png",
+  plot = panel_selected_final,
+  width = 10,
+  height = 10,
+  dpi = 300,
+  bg = "white"
+)
+```
+
+## Cartes CMY des déssaccord entre les modèles
+
+```{r CMY}
+# ==========================================
+# PARAMÈTRES GLOBAUX
+# ==========================================
+GAMMA <- 1
+QUANTILES <- c(0, 1)
+INTENSITY_FLOOR <- 1.5
+
+# ==========================================
+# 1. CALCUL DES QUANTILES GLOBAUX SUR LES 3 DF
+# ==========================================
+# Combine les SD de tous les jeux de données pour avoir une plage unique
+# ==========================================
+# 1. CALCUL DES QUANTILES PAR DATASET
+# ==========================================
+get_sd_range <- function(df, quantiles = QUANTILES) {
+  df_wide <- df %>%
+    tidyr::pivot_wider(names_from = Model, values_from = value) %>%
+    mutate(sd_val = apply(dplyr::select(., D2, SAM, D2S), 1, sd, na.rm = TRUE))
+  quantile(df_wide$sd_val, quantiles, na.rm = TRUE)
+}
+
+sd_range_med  <- get_sd_range(df_Med)
+sd_range_sum  <- get_sd_range(df_Sum)
+sd_range_nbi  <- get_sd_range(df_Nbi)
+
+cat("SD ranges utilisés :\n")
+cat(" - Med :", round(sd_range_med,  3), "\n")
+cat(" - Sum :", round(sd_range_sum,  3), "\n")
+cat(" - Nbi :", round(sd_range_nbi,  3), "\n")
+# ==========================================
+# 2. FONCTIONS COMMUNES (inchangées)
+# ==========================================
+normalize_cmy <- function(c_raw, m_raw, y_raw) {
+  c_raw[!is.finite(c_raw)] <- 0
+  m_raw[!is.finite(m_raw)] <- 0  
+  y_raw[!is.finite(y_raw)] <- 0
+  max_val <- pmax(c_raw, pmax(m_raw, y_raw))
+  max_val[max_val == 0 | !is.finite(max_val)] <- 1
+  list(C = c_raw / max_val, M = m_raw / max_val, Y = y_raw / max_val)
+}
+
+calculate_intensity <- function(sd_values, sd_range = sd_range_global, gamma = GAMMA, floor = INTENSITY_FLOOR) {
+  I_raw <- scales::rescale(sd_values, to = c(0, 1), from = sd_range)
+  I_raw[!is.finite(I_raw)] <- 0
+  pmax(I_raw, floor) ^ gamma
+}
+
+cmy_to_rgb <- function(C, M, Y, I) {
+  list(
+    R = pmin(pmax((1 - C) * I, 0), 1),
+    G = pmin(pmax((1 - M) * I, 0), 1),
+    B = pmin(pmax((1 - Y) * I, 0), 1)
+  )
+}
+
+create_cmy_map <- function(df_wide, sd_range = sd_range_global) {
+  df_processed <- df_wide %>%
+    mutate(
+      mean_val = ifelse(mean_val == 0 | !is.finite(mean_val), 1e-10, mean_val),
+      C_raw = D2 / mean_val,
+      M_raw = SAM / mean_val,
+      Y_raw = D2S / mean_val
+    )
+  cmy <- normalize_cmy(df_processed$C_raw, df_processed$M_raw, df_processed$Y_raw)
+  I <- calculate_intensity(df_processed$sd_val, sd_range)
+  rgb_vals <- cmy_to_rgb(cmy$C, cmy$M, cmy$Y, I)
+  df_processed %>%
+    mutate(
+      C = cmy$C, M = cmy$M, Y = cmy$Y, I = I,
+      R = rgb_vals$R, G = rgb_vals$G, B = rgb_vals$B,
+      hex = rgb(R, G, B)
+    )
+}
+
+create_cmy_triangle <- function(sd_range = sd_range_global, gamma = GAMMA, floor = INTENSITY_FLOOR, n = 200) {
+  h <- sqrt(3)/2
+  tri_grid <- expand.grid(x = seq(0, 1, length.out = n), y = seq(0, h, length.out = n))
+  tri_grid <- tri_grid[
+    tri_grid$y >= 0 &
+    tri_grid$y <= h &
+    tri_grid$x >= tri_grid$y / sqrt(3) &
+    tri_grid$x <= 1 - tri_grid$y / sqrt(3), ]
+  Y_raw <- (2 / sqrt(3)) * tri_grid$y
+  C_raw <- tri_grid$x - 0.5 * Y_raw
+  M_raw <- 1 - C_raw - Y_raw
+  cmy <- normalize_cmy(C_raw, M_raw, Y_raw)
+  sd_sim <- scales::rescale(tri_grid$y, to = sd_range, from = c(0, h))
+  I <- calculate_intensity(sd_sim, sd_range, gamma, floor)
+  rgb_vals <- cmy_to_rgb(cmy$C, cmy$M, cmy$Y, I)
+  data.frame(
+    x = tri_grid$x, y = tri_grid$y,
+    C = cmy$C, M = cmy$M, Y = cmy$Y, I = I,
+    hex = rgb(rgb_vals$R, rgb_vals$G, rgb_vals$B)
+  )
+}
+make_triangle_plot <- function(tri_data, sd_range, title) {
+  h <- sqrt(3)/2
+  
+  ggplot(tri_data, aes(x = x, y = y)) +
+    geom_raster(aes(fill = hex)) +
+    scale_fill_identity() +
+    
+    # Contours du triangle
+    geom_segment(x = 0, y = 0, xend = 1, yend = 0, color = "black", size = 0.5, inherit.aes = FALSE) +
+    geom_segment(x = 1, y = 0, xend = 0.5, yend = h, color = "black", size = 0.5, inherit.aes = FALSE) +
+    geom_segment(x = 0.5, y = h, xend = 0, yend = 0, color = "black", size = 0.5, inherit.aes = FALSE) +
+    
+    # Lignes médianes
+    geom_segment(x = 0.5, y = h/3, xend = 0, yend = 0, color = "white", linetype = "dashed", alpha = 0.6) +
+    geom_segment(x = 0.5, y = h/3, xend = 1, yend = 0, color = "white", linetype = "dashed", alpha = 0.6) +
+    geom_segment(x = 0.5, y = h/3, xend = 0.5, yend = h, color = "white", linetype = "dashed", alpha = 0.6) +
+    
+    # Points (repères)
+    geom_point(aes(x = 0.5, y = h/3), color = "grey", size = 1, inherit.aes = FALSE) +       
+    geom_point(aes(x = 0.25, y = 0.144), color = "#3e3e3e", size = 1, inherit.aes = FALSE) + 
+    geom_point(aes(x = 0.00, y = 0.00), color = "#3e3e3e", size = 1, inherit.aes = FALSE) + 
+    geom_point(aes(x = 0.75, y = 0.144), color = "#3e3e3e", size = 1, inherit.aes = FALSE) + 
+    geom_point(aes(x = 1, y = 0.00), color = "#3e3e3e", size = 1, inherit.aes = FALSE) +    
+    geom_point(aes(x = 0.50, y = (2*h)/3), color = "#3e3e3e", size = 1, inherit.aes = FALSE) +
+    geom_point(aes(x = 0.50, y = h*1), color = "#3e3e3e", size = 1, inherit.aes = FALSE) +  
+    
+    # Ajustement des marges pour laisser place aux labels
+    coord_equal(xlim = c(-0.5, 1.5), ylim = c(-0.5, h + 0.5), expand = FALSE) +
+    theme_void(base_size = 11) +
+    
+    # Labels des coins (légèrement décalés vers l'extérieur)
+    annotate("text", x = 0, y = -0.06, label = "SAM", 
+             hjust = 0.5, vjust = 1, size = 6, color = "black", fontface = "bold") +
+    annotate("text", x = 1, y = -0.06, label = "Detectree2", 
+             hjust = 0.5, vjust = 1, size = 6, color = "black", fontface = "bold") +
+    annotate("text", x = 0.5, y = h + 0.12, label = "Detectree2SAM", 
+             hjust = 0.5, vjust = 0, size = 6, color = "black", fontface = "bold") +
+    
+    # Annotations pour les % (inchangées)
+    annotate("text", x = 0.50, y = (h/3)+0.02, color = "#3e3e3e", label = "0%", size = 6, hjust = 0.5, vjust = -0.75) +
+    annotate("text", x = 0.25, y = h/6, color = "#3e3e3e", label = "50%", size = 6, hjust = 0.5, vjust = -0.5) +
+    annotate("text", x = 0.04, y = 0.01, color = "#3e3e3e", label = "100%", size = 6, hjust = 0, vjust = -0.5) +
+    
+    annotate("text", x = 0.75, y = h/6, color = "#3e3e3e", label = "50%", size = 6, hjust = 0.5, vjust = -0.5) +
+    annotate("text", x = 0.96, y = 0.01, color = "#3e3e3e", label = "100%", size = 6, hjust = 1, vjust = -0.5) +
+    
+    annotate("text", x = 0.5, y = (2*h)/3, color = "#3e3e3e", label = "50%", size = 6, hjust = 0.5, vjust = -0.5) +
+    annotate("text", x = 0.5, y = h - 0.04, color = "#3e3e3e", label = "100%", size = 6, hjust = 0.5, vjust = -0.60) +
+    
+    labs(title = title) +
+    theme(
+      plot.background = element_blank(),
+      panel.background = element_blank(),
+      plot.margin = margin(5, 5, 5, 5),
+      plot.title = element_text(color = "black", hjust = 0.5, size = 12, face = "bold")
+    )
+}
+# ==========================================
+# 3. CRÉATION DES CARTES POUR LES 3 DATASETS
+# ==========================================
+prep_and_plot <- function(df, sd_range, title) {
+  df_wide <- df %>%
+    pivot_wider(names_from = Model, values_from = value) %>%
+    mutate(
+      mean_val = rowMeans(across(c(D2, SAM, D2S)), na.rm = TRUE),
+      sd_val = apply(across(c(D2, SAM, D2S)), 1, sd, na.rm = TRUE)
+    )
+  df_map <- create_cmy_map(df_wide, sd_range)
+  tri_data <- create_cmy_triangle(sd_range, GAMMA, INTENSITY_FLOOR)
+  p_map <- ggplot(df_map, aes(x, y)) +
+    geom_raster(aes(fill = hex)) + 
+    scale_fill_identity() +
+    coord_fixed(ratio = 1) +
+    labs(
+      title = title,
+      x = "Easting (m)",
+      y = "Northing (m)"
+    ) +
+    theme_classic(base_size = 11) +
+    theme(
+     axis.line = element_blank(),
+     panel.background = element_rect(fill = "white", colour = NA),
+     plot.background  = element_rect(fill = "white", colour = NA),
+     panel.grid       = element_blank(),   # supprime la grille
+     axis.text        = element_blank(),
+     axis.title       = element_blank(),
+     axis.ticks       = element_blank(),   # supprime les petits traits
+     plot.title       = element_text(color = "black", hjust = 0.5, face = "bold")
+    )
+  list(map = p_map, triangle = tri_data)
+}
+# --- 2) Création des cartes ---
+res_med <- prep_and_plot(df_Med, sd_range_med, "Median Crown Area")
+res_sum <- prep_and_plot(df_Sum, sd_range_sum, "Sum Crown Area")
+res_nbi <- prep_and_plot(df_Nbi, sd_range_nbi, "Crown Density")
+
+# 2) Création des cartes (inchangé)
+res_med$map <- res_med$map + labs(title = NULL)
+res_sum$map <- res_sum$map + labs(title = NULL)
+res_nbi$map <- res_nbi$map + labs(title = NULL)
+
+# --- 3) Carte triangle unique avec % ---
+sd_range_global <- range(c(sd_range_med, sd_range_sum, sd_range_nbi))
+tri_data <- create_cmy_triangle(sd_range = sd_range_global, GAMMA, INTENSITY_FLOOR)
+
+triangle_plot <- make_triangle_plot(
+  tri_data,
+  sd_range_global,
+  title = " "
+)
+
+# --- 4) Organisation des cartes en lignes/colonnes ---
+top_row <- plot_grid(
+  res_med$map, res_sum$map,
+  ncol = 2,
+  labels = c("A", "B"),
+  label_size = 16,
+  label_fontface = "bold",
+  label_x = c(0.02, 0.02),   # place exactement à gauche
+  label_y = c(0.98, 0.98)  # un peu plus haut que le plot
+)
+
+bottom_row <- plot_grid(
+  res_nbi$map,
+  labels = "C",
+  label_size = 16,
+  label_x = 0.02,
+  label_y = 1.05
+)
+
+# --- 5) Combiner cartes + triangle en bas ---
+final_panel <- plot_grid(
+  top_row,
+  plot_grid(bottom_row, triangle_plot, ncol = 2, rel_widths = c(0.5, 0.5)),
+  ncol = 1,
+  rel_heights = c(1, 1)
+)
+
+# --- 6) Export ---
+ggsave(
+  filename = "D:/PhD/Data/Art1_rendu/Graphique/CMY_map_triangle_w.png",
+  plot = final_panel,
+  width = 10,
+  height = 10,
+  dpi = 300,
+  bg = "white"
+)
+
+```
+## Maps final
+```{r plot total}
+# === Export des cartes Best Maps ===
+ggsave("D:/PhD/Data/Art1_rendu/Graphique/map_Med_D2S.png",
+       plot = map_Med_D2S, width = 2.5, height = 3, dpi = 300, bg = "white")
+
+ggsave("D:/PhD/Data/Art1_rendu/Graphique/map_Sum_D2S.png",
+       plot = map_Sum_D2S, width = 2.5, height = 3, dpi = 300, bg = "white")
+
+ggsave("D:/PhD/Data/Art1_rendu/Graphique/map_Nbi_SAM.png",
+       plot = map_Nbi_SAM, width = 2.5, height = 3, dpi = 300, bg = "white")
+
+# === Export des cartes CMY ===
+ggsave("D:/PhD/Data/Art1_rendu/Graphique/map_Med_CMY.png",
+       plot = res_med$map, width = 2.5, height = 3, dpi = 300, bg = "white")
+
+ggsave("D:/PhD/Data/Art1_rendu/Graphique/map_Sum_CMY.png",
+       plot = res_sum$map, width = 2.5, height = 3, dpi = 300, bg = "white")
+
+ggsave("D:/PhD/Data/Art1_rendu/Graphique/map_Nbi_CMY.png",
+       plot = res_nbi$map, width = 2.5, height = 3, dpi = 300, bg = "white")
+
+# === Export du triangle CMY ===
+ggsave("D:/PhD/Data/Art1_rendu/Graphique/triangle_CMY.png",
+       plot = triangle_plot, width = 5, height = 5, dpi = 300, bg = "white")
+
+```
+# 4. Description de Luki à l'échelle du paysage
+
+```{r prep dataset}
+# --- Aire de couronne (toutes les couronnes)
+df_area_long <- bind_rows(
+  Detectree2 |> st_drop_geometry() |> dplyr::select(area_m2) |> mutate(Model = "Detectree2"),
+  SAM |> st_drop_geometry() |> dplyr::select(area_m2) |> mutate(Model = "SAM"),
+  D2S |> st_drop_geometry() |> dplyr::select(area_m2) |> mutate(Model = "D2S")
+)
+# --- Indice de circularité (exemple : 4*pi*Area / Perimeter^2)
+df_SI_long <- bind_rows(
+  Detectree2 |> st_drop_geometry() |> dplyr::select(SI) |> mutate(Model = "Detectree2"),
+  SAM |> st_drop_geometry() |> dplyr::select(SI) |> mutate(Model = "SAM"),
+  D2S |> st_drop_geometry() |> dplyr::select(SI) |> mutate(Model = "D2S")
+)
+if ("D2" %in% unique(df_Nbi$Model)) {
+  df_Nbi$Model[df_Nbi$Model == "D2"] <- "Detectree2"
+}
+if ("D2" %in% unique(df_Med$Model)) {
+  df_Med$Model[df_Med$Model == "D2"] <- "Detectree2"
+}
+if ("D2" %in% unique(df_Sum$Model)) {
+  df_Sum$Model[df_Sum$Model == "D2"] <- "Detectree2"
+}
+# === Création des graphiques avec couleurs et axe x modifiable ===
+xlim_area <- c(0, 400)  # <--- MODIFIE CETTE VALEUR POUR ZOOMER SUR L'AXE X
+xlim_SI   <- c(0.6, 1)    # Shape Index entre 0 et 1
+xlim_Nbi  <- c(0, 200)  # <--- Modifie selon tes valeurs
+xlim_Med  <- c(0, 400)  # <--- Modifie selon tes valeurs
+xlim_Sum  <- c(0, 9000)  # <--- Modifie selon tes valeurs
+# === Palette CMY pastel adaptée pour fond blanc ===
+model_colors_pastel <- c(
+  "Detectree2" = "#33CCCC",  # Cyan un peu plus foncé
+  "SAM"        = "#CC33CC",  # Magenta un peu plus foncé
+  "D2S"        = "#CCAA00"   # Jaune doré pour rester lisible sur fond blanc
+)
+
+# === Distribution de l'aire des couronnes ===
+plot_area <- ggplot(df_area_long, aes(x = area_m2, fill = Model, color = Model)) +
+  geom_density(alpha = 0.3, linewidth = 1) +
+  scale_fill_manual(values = model_colors_pastel, name = "Method") +
+  scale_color_manual(values = model_colors_pastel, name = "Method") +
+  scale_x_continuous(limits = xlim_area)+
+  labs(x = "Canopy Crown Area (m²)", y = "Density") +
+  theme_minimal(base_size = 13) +
+  theme(
+    plot.background  = element_rect(fill = "white", colour = NA),
+    panel.background = element_rect(fill = "white", colour = NA),
+    legend.position  = "top"
+  )
+
+# === Distribution du Shape Index (SI) ===
+plot_SI <- ggplot(df_SI_long, aes(x = SI, fill = Model, color = Model)) +
+  geom_density(alpha = 0.3, linewidth = 1) +
+  scale_fill_manual(values = model_colors_pastel, name = "Method") +
+  scale_color_manual(values = model_colors_pastel, name = "Method") +
+  scale_x_continuous(limits = xlim_SI)+
+  labs(x = "Shape Index (SI)", y = "Density") +
+  theme_minimal(base_size = 13) +
+  theme(
+    plot.background  = element_rect(fill = "white", colour = NA),
+    panel.background = element_rect(fill = "white", colour = NA),
+    legend.position  = "top"
+  )
+
+# === Distribution de la densité de couronnes ===
+plot_Nbi <- ggplot(df_Nbi, aes(x = value, fill = Model, color = Model)) +
+  geom_density(alpha = 0.3, linewidth = 1) +
+  scale_fill_manual(values = model_colors_pastel, name = "Method") +
+  scale_color_manual(values = model_colors_pastel, name = "Method") +
+  scale_x_continuous(limits = xlim_Nbi)+
+  labs(x = "Canopy Crown Density (ind/ha)", y = "Density") +
+  theme_minimal(base_size = 13) +
+  theme(
+    plot.background  = element_rect(fill = "white", colour = NA),
+    panel.background = element_rect(fill = "white", colour = NA),
+    legend.position  = "top"
+  )
+
+# === Distribution de la Mediane des top 20 couronnes ===
+plot_Med_area <- ggplot(df_Med, aes(x = value, fill = Model, color = Model)) +
+  geom_density(alpha = 0.3, linewidth = 1) +
+  scale_fill_manual(values = model_colors_pastel, name = "Method") +
+  scale_color_manual(values = model_colors_pastel, name = "Method") +
+  scale_x_continuous(limits = xlim_Med)+
+  labs(x = "Median Crown Area of the Top 20 Crowns/ha (m²)", y = "Density") +
+  theme_minimal(base_size = 13) +
+  theme(
+    plot.background  = element_rect(fill = "white", colour = NA),
+    panel.background = element_rect(fill = "white", colour = NA),
+    legend.position  = "top"
+  )
+
+# === Distribution de la somme des top 20 couronnes ===
+plot_Sum_Aire <- ggplot(df_Sum, aes(x = value, fill = Model, color = Model)) +
+  geom_density(alpha = 0.3, linewidth = 1) +
+  scale_fill_manual(values = model_colors_pastel, name = "Method") +
+  scale_color_manual(values = model_colors_pastel, name = "Method") +
+  scale_x_continuous(limits = xlim_Sum)+
+  labs(x = "Sum Crown Area of the Top 20 Crowns/ha (m²)", y = "Density") +
+  theme_minimal(base_size = 13) +
+  theme(
+    plot.background  = element_rect(fill = "white", colour = NA),
+    panel.background = element_rect(fill = "white", colour = NA),
+    legend.position  = "top"
+  )
+
+# === Combiner avec patchwork pour avoir UNE seule légende ===
+panel_distributions <- (
+  plot_area + plot_SI + plot_Med_area + plot_Sum_Aire + plot_Nbi
+) +
+  plot_layout(ncol = 1, guides = "collect") &
+  theme(legend.position = "top")
+
+# === Ajouter les labels A, B, C, D, E ===
+panel_distributions <- panel_distributions +
+  plot_annotation(tag_levels = "A") &  # Ajoute A, B, C, ...
+  theme(plot.tag = element_text(size = 16, face = "bold"))  # Style des tags
+
+# Export
+ggsave(
+  filename = "D:/PhD/Data/Art1_rendu/Graphique/destriptive_Luki.png",
+  plot = panel_distributions,
+  width = 8,
+  height = 16,
+  dpi = 300,
+  bg = "white"
+)
+```
+## Statistique Descriptive
+```{r stat_descriptive}
+# === Calculer médiane et écart-type par modèle ===
+# === Créer un tableau unique pour les 5 distributions ===
+stats_all <- bind_rows(
+  df_area_long %>%
+    group_by(Model) %>%
+    summarise(median = median(area_m2, na.rm = TRUE),
+              sd = sd(area_m2, na.rm = TRUE), .groups = "drop") %>%
+    mutate(Metric = "Crown Area (m²)"),
+  
+  df_SI_long %>%
+    group_by(Model) %>%
+    summarise(median = median(SI, na.rm = TRUE),
+              sd = sd(SI, na.rm = TRUE), .groups = "drop") %>%
+    mutate(Metric = "Shape Index (SI)"),
+  
+  
+  df_Med %>%
+    group_by(Model) %>%
+    summarise(median = median(value, na.rm = TRUE),
+              sd = sd(value, na.rm = TRUE), .groups = "drop") %>%
+    mutate(Metric = "Median Crown Area (Top 20)"),
+  
+  df_Sum %>%
+    group_by(Model) %>%
+    summarise(median = median(value, na.rm = TRUE),
+              sd = sd(value, na.rm = TRUE), .groups = "drop") %>%
+    mutate(Metric = "Sum Crown Area (Top 20)"),
+  
+  df_Nbi %>%
+    group_by(Model) %>%
+    summarise(median = median(value, na.rm = TRUE),
+              sd = sd(value, na.rm = TRUE), .groups = "drop") %>%
+    mutate(Metric = "Canopy Crown Density (ind/ha)")
+) %>%
+  dplyr::select(Metric, Model, Median = median, `SD` = sd)
+
+# === Créer un joli tableau avec knitr + kableExtra ===
+kable(stats_all, format = "html", digits = 2, align = "lccc",
+      caption = "Médiane et écart-type pour chaque métrique et modèle") %>%
+  kable_styling(full_width = FALSE, bootstrap_options = c("striped", "hover", "condensed")) %>%
+  column_spec(1, bold = TRUE) %>%
+  collapse_rows(columns = 1, valign = "top")
+
+```
+## ANOVA
+```{r ANOVA}
+# --- 1) Fonctions pour chaque type de test ---
+run_anova <- function(data, value_col, metric_name) {
+  form <- as.formula(paste(value_col, "~ Model"))
+  model <- aov(form, data = data)
+  res <- tidy(model) %>% filter(term != "Residuals")
+  
+  # Post-hoc Tukey
+  tukey <- TukeyHSD(model)
+  tukey_df <- as.data.frame(tukey$Model)
+  tukey_df <- tibble::rownames_to_column(tukey_df, "Comparison")
+  
+  list(
+    test = res %>% mutate(Metric = metric_name, Test = "ANOVA"),
+    posthoc = tukey_df
+  )
+}
+
+run_kruskal <- function(data, value_col, metric_name) {
+  form <- as.formula(paste(value_col, "~ Model"))
+  model <- kruskal.test(form, data = data)
+  res <- tidy(model)
+  
+  # Post-hoc pairwise Wilcoxon
+  pairwise <- pairwise.wilcox.test(data[[value_col]], data$Model,
+                                   p.adjust.method = "BH")
+  pairwise_df <- as.data.frame(as.table(pairwise$p.value)) %>%
+    filter(!is.na(Freq)) %>%
+    rename(Comparison1 = Var1, Comparison2 = Var2, p.value = Freq)
+  
+  list(
+    test = res %>% mutate(Metric = metric_name, Test = "Kruskal-Wallis"),
+    posthoc = pairwise_df
+  )
+}
+
+# --- 2) Appliquer tes choix ---
+results <- list(
+  area = run_kruskal(df_area_long, "area_m2", "Crown Area (m²)"),
+  SI   = run_kruskal(df_SI_long, "SI", "Shape Index (SI)"),
+  Nbi  = run_kruskal(df_Nbi, "value", "Canopy Crown Density"),
+  Med  = run_anova(df_Med, "value", "Median Crown Area (Top 20)"),
+  Sum  = run_anova(df_Sum, "value", "Sum Crown Area (Top 20)")
+)
+
+# --- 3) Tableau des tests globaux ---
+global_tests <- bind_rows(lapply(results, function(x) x$test)) %>%
+  dplyr::select(Metric, Test, statistic, p.value)
+
+kable(global_tests, digits = 4,
+      caption = "Tests globaux (ANOVA ou Kruskal selon les distributions)") %>%
+  kable_styling(full_width = FALSE, bootstrap_options = c("striped", "hover"))
+
+# --- 4) (Optionnel) Tableau des comparaisons post-hoc pour inspection ---
+posthoc_all <- bind_rows(lapply(names(results), function(nm) {
+  df <- results[[nm]]$posthoc
+  df$Metric <- results[[nm]]$test$Metric[1]
+  df
+}))
+
+kable(posthoc_all, digits = 4,
+      caption = "Comparaisons par paires (Tukey ou Wilcoxon selon le test choisi)") %>%
+  kable_styling(full_width = FALSE, bootstrap_options = c("striped", "hover"))
+
+```

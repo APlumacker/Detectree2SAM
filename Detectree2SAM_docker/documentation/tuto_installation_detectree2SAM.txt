@@ -1,0 +1,33 @@
+Créer un nouvel environ anaconda. Dans cet environnement, activer spyder et une console prompt.
+
+2 possibilités:
+	Importer l'environement detectree2SAM.yaml présent dans le dossier documentation.
+	Si ananconda indique une erreur continuer quand même. Lancer le programme detectree2SAM_main
+	et installer les packages manquants manuellement (voir la suite)
+
+ou :
+
+	Dans la console anaconda:
+	- installer git sur son ordi 
+	- installer visual studio https://stackoverflow.com/questions/52383577/installing-ms-c-14-0-for-python-without-visual-studio
+	- installer GDAL (librairie trèèèèèèès pénible, à éviter autant que possible) : "conda install -c conda-forge gdal"
+	- Installer Rasterio : "pip install rasterio"
+	- Installer pytorch : https://pytorch.org/get-started/locally/
+		Attention, il faut avoir la même version des pilotes CUDA 11.8 que pytorch. Utiliser l'"pip install torch"
+	- Installer geopandas : "pip install geopandas"
+	- Installer detectron2 : "pip install git+https://github.com/facebookresearch/detectron2.git"
+	- Installer segmentAnything : "pip install git+https://github.com/facebookresearch/segment-anything.git"
+
+Remarque Antoine: D'abord 
+- installer anaconda
+- importer l'environnement detectree2SAM.yaml
+- installer git sur son ordi 
+- installer CUDA 11.8
+- installer visual studio https://stackoverflow.com/questions/52383577/installing-ms-c-14-0-for-python-without-visual-studio
+
+Puis installer sur le prompt 
+- pip3 install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118
+- pip install git+https://github.com/facebookresearch/detectron2.git
+- pip install git+https://github.com/facebookresearch/segment-anything.git
+
+L'ordre est important
