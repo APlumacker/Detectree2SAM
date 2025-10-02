@@ -444,9 +444,18 @@ kable(results_table_pixel, format = "html", digits = 3,
 plots_filtered_top20 <- plots[!plots$Nom %in% c("Pheno2", "Parc6"), ]
 
 # Jointure spatiale pour récupérer l'attribut 'Nom' des parcelles
-detectree_top <- st_join(tree_detectree_plot, plots_filtered_top20, join = st_intersects)
-SAM_top       <- st_join(tree_SAM_plot, plots_filtered_top20, join = st_intersects)
-d2s_top       <- st_join(tree_d2s_plot, plots_filtered_top20, join = st_intersects)
+
+rename_nom <- function(df) {
+  if (!"Nom" %in% names(df)) {
+    if ("Nom.x" %in% names(df)) names(df)[names(df) == "Nom.x"] <- "Nom"
+    else if ("Nom.y" %in% names(df)) names(df)[names(df) == "Nom.y"] <- "Nom"
+  }
+  df
+}
+
+detectree_top <- rename_nom(st_join(tree_detectree_plot, plots_filtered_top20, join = st_intersects))
+SAM_top       <- rename_nom(st_join(tree_SAM_plot,       plots_filtered_top20, join = st_intersects))
+d2s_top       <- rename_nom(st_join(tree_d2s_plot,       plots_filtered_top20, join = st_intersects))
 
 # --- Sélection des 20 plus grands arbres PAR PARCELLE ---
 top20_detectree <- detectree_top %>%
@@ -601,11 +610,11 @@ kable(table_r2_rmse, digits = 3, caption = "Comparaison des performances (Média
 # --- Filtrer la photointerprétation et les segmentations ---
 photointerpretation_inventory_filtered <- photointerpretation_inventory[!photointerpretation_inventory$Nom %in% c("Pheno2", "Parc6"), ]
 
-# Jointure spatiale pour récupérer l'attribut 'Nom' des parcelles
-tree_detectree_plot_density  <- st_join(tree_detectree_plot, plots_filtered_top20, join = st_intersects)
-tree_SAM_plot_density        <- st_join(tree_SAM_plot, plots_filtered_top20, join = st_intersects)
-tree_d2s_plot_density        <- st_join(tree_d2s_plot, plots_filtered_top20, join = st_intersects)
+tree_detectree_plot_density <- rename_nom(st_join(tree_detectree_plot, plots_filtered_top20, join = st_intersects))
 
+tree_SAM_plot_density <- rename_nom(st_join(tree_SAM_plot, plots_filtered_top20, join = st_intersects))
+
+tree_d2s_plot_density <- rename_nom(st_join(tree_d2s_plot, plots_filtered_top20, join = st_intersects))
 # --- Calculer surface (ha) de chaque parcelle ---
 plots_area <- plot_filtered %>%
   filter(!Nom %in% c("Pheno2", "Parc6")) %>%
