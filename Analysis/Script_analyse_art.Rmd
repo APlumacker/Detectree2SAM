@@ -1298,15 +1298,15 @@ make_triangle_plot <- function(tri_data, sd_range, title) {
              hjust = 0.5, vjust = 0, size = 6, color = "black", fontface = "bold") +
     
     # Annotations pour les % (inchangées)
-    annotate("text", x = 0.50, y = (h/3)+0.02, color = "#3e3e3e", label = "0%", size = 6, hjust = 0.5, vjust = -0.75) +
+    annotate("text", x = 0.50, y = (h/3)+0.02, color = "#3e3e3e", label = "100%", size = 6, hjust = 0.5, vjust = -0.75) +
     annotate("text", x = 0.25, y = h/6, color = "#3e3e3e", label = "50%", size = 6, hjust = 0.5, vjust = -0.5) +
-    annotate("text", x = 0.04, y = 0.01, color = "#3e3e3e", label = "100%", size = 6, hjust = 0, vjust = -0.5) +
+    annotate("text", x = 0.06, y = 0.01, color = "#3e3e3e", label = "0%", size = 6, hjust = 0, vjust = -0.5) +
     
     annotate("text", x = 0.75, y = h/6, color = "#3e3e3e", label = "50%", size = 6, hjust = 0.5, vjust = -0.5) +
-    annotate("text", x = 0.96, y = 0.01, color = "#3e3e3e", label = "100%", size = 6, hjust = 1, vjust = -0.5) +
+    annotate("text", x = 0.94, y = 0.01, color = "#3e3e3e", label = "0%", size = 6, hjust = 1, vjust = -0.5) +
     
     annotate("text", x = 0.5, y = (2*h)/3, color = "#3e3e3e", label = "50%", size = 6, hjust = 0.5, vjust = -0.5) +
-    annotate("text", x = 0.5, y = h - 0.04, color = "#3e3e3e", label = "100%", size = 6, hjust = 0.5, vjust = -0.60) +
+    annotate("text", x = 0.5, y = h - 0.04, color = "#3e3e3e", label = "0%", size = 6, hjust = 0.5, vjust = -0.60) +
     
     labs(title = title) +
     theme(
