@@ -27,12 +27,12 @@ cryptography
 cycler==0.12.1
 decorator
 detectron2 @ git+https://github.com/facebookresearch/detectron2.git@65184fc057d4fab080a98564f6b60fae0b94edc4
-dnspython==2.4.2
+dnspython==2.6.1
 exceptiongroup
 executing
 expecttest==0.1.6
 filelock
-Fiona==1.8.22
+Fiona==1.10b2
 fonttools==4.58.0
 fsspec==2023.9.2
 fvcore==0.1.5.post20221221
@@ -78,7 +78,7 @@ platformdirs==4.3.8
 pluggy
 portalocker==3.1.1
 prompt-toolkit
-protobuf==6.31.0
+protobuf==6.31.1
 psutil
 ptyprocess
 pure-eval
@@ -111,7 +111,7 @@ tensorboard-data-server==0.7.2
 termcolor==3.1.0
 tomli
 toolz
-torch==2.1.0
+torch==2.8.0
 torchaudio==2.1.0
 torchelastic==0.2.2
 torchvision==0.16.0
